@@ -1,0 +1,15 @@
+[package]
+name = "stm32f429-usb"
+version = "0.1.0"
+authors = ["Albert Moravec <albert.moravec@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+vcell = "0.1.0"
+bare-metal = "0.2.4"
+cortex-m = "0.5.8"
+usb-device = { path = "../usb-device" }
+#stm32f4 = { version = "0.5.0", features = ["stm32f429"] }
+#stm32f4xx-hal = { version = "0.2.8", features = ["stm32f429"] }
+stm32f4xx-hal = { path = "../stm32f4xx-hal", features = ["stm32f429"] }
+cortex-m-semihosting = "0.3.2"
