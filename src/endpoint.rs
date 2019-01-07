@@ -6,7 +6,6 @@ use cortex_m::interrupt;
 use usb_device::endpoint::{EndpointType, EndpointAddress};
 use usb_device::{Result, UsbDirection};
 use stm32f4xx_hal::stm32f4::stm32f429::OTG_FS_DEVICE;
-use cortex_m_semihosting::hprintln;
 
 type EndpointBuffer = &'static mut [VolatileCell<u32>];
 
@@ -73,8 +72,6 @@ impl InEndpoint {
 
 impl Endpoint for InEndpoint {
     fn reset(&self, otg_fs_device: &OTG_FS_DEVICE) {
-        hprintln!("in ep reset called").unwrap();
-
         match self.index {
             0 => {
                 otg_fs_device.fs_diepctl0.modify(|_, w| w.snak().set_bit());
@@ -210,8 +207,6 @@ impl OutEndpoint {
 
 impl Endpoint for OutEndpoint {
     fn reset(&self, otg_fs_device: &OTG_FS_DEVICE) {
-        hprintln!("out ep reset called").unwrap();
-
         otg_fs_device.fs_daintmsk.modify(|r, w| unsafe { w.oepint().bits(r.oepint().bits() & !(1 << self.index)) });
 //        otg_fs_device.diepempmsk.modify(|r, w| unsafe { w.ineptxfem().bits(r.ineptxfem().bits() & (1 << self.index)) }); // tx fifo empty interrupt mask
 

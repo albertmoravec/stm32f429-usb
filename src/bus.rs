@@ -12,7 +12,6 @@ use usb_device::{UsbDirection, UsbError, Result};
 use stm32f4xx_hal::stm32f4::stm32f429::{OTG_FS_DEVICE, OTG_FS_GLOBAL, OTG_FS_PWRCLK, otg_fs_global::FS_GRXSTSR_DEVICE, otg_fs_global::fs_grxstsr_device::{DPIDR, PKTSTSR}};
 use stm32f4xx_hal::stm32f4::stm32f429::otg_fs_global::fs_grxstsr_device::R as GrxstsrReg;
 use stm32f4xx_hal::gpio::{gpioa, gpiob, Alternate, AF12, AF10};
-use cortex_m_semihosting::hprintln;
 
 pub struct UsbBus {
     regs: AtomicMutex<UsbRegs>,
@@ -106,7 +105,6 @@ impl UsbBus {
                dm_pin: gpioa::PA11<Alternate<AF10>>,
                dp_pin: gpioa::PA12<Alternate<AF10>>,
     ) -> UsbBusAllocator<Self> {
-        hprintln!("initializing usb").unwrap();
         let bus = UsbBus {
             regs: AtomicMutex::new(UsbRegs {
                 otg_fs_global,
@@ -139,10 +137,8 @@ impl UsbBus {
             waiting_read: AtomicMutex::new(WaitingPacketInfoWrapper { waiting_packet_info: None }),
         };
 
-        hprintln!("calling usb bus allocator").unwrap();
 
         let usbbus = UsbBusAllocator::new(bus);
-        hprintln!("usb bus allocator called").unwrap();
 
         usbbus
     }
@@ -226,8 +222,6 @@ impl UsbBus {
     fn flush_tx_fifos(&self, regs: &UsbRegs) {
         regs.otg_fs_global.fs_grstctl.modify(|_, w| unsafe { w.txfnum().bits(0b10000).txfflsh().set_bit() });
 
-        hprintln!("waiting for tx fifos to flush").unwrap();
-
         while regs.otg_fs_global.fs_grstctl.read().txfflsh().bit_is_set() {}
 
         delay(60);
@@ -235,8 +229,6 @@ impl UsbBus {
 
     fn flush_tx_fifo(&self, regs: &UsbRegs, ep_num: u8) {
         regs.otg_fs_global.fs_grstctl.modify(|_, w| unsafe { w.txfnum().bits(ep_num).txfflsh().set_bit() });
-
-        hprintln!("waiting for tx fifo to flush").unwrap();
 
         while regs.otg_fs_global.fs_grstctl.read().txfflsh().bit_is_set() {}
 
@@ -246,22 +238,17 @@ impl UsbBus {
     fn flush_rx_fifo(&self, regs: &UsbRegs) {
         regs.otg_fs_global.fs_grstctl.modify(|_, w| w.rxfflsh().set_bit());
 
-        hprintln!("waiting for rx fifo to flush").unwrap();
-
         while regs.otg_fs_global.fs_grstctl.read().rxfflsh().bit_is_set() {}
 
         delay(60);
     }
 
     fn reset_core(&self, regs: &UsbRegs) {
-        hprintln!("waiting for ahb to become idle").unwrap();
         // wait for AHB to become idle
         while regs.otg_fs_global.fs_grstctl.read().ahbidl().bit_is_clear() {}
 
-        hprintln!("resetting core").unwrap();
         regs.otg_fs_global.fs_grstctl.modify(|_, w| w.csrst().set_bit());
 
-        hprintln!("waiting for core to reset").unwrap();
         while regs.otg_fs_global.fs_grstctl.read().csrst().bit_is_set() {}
     }
 
@@ -294,25 +281,19 @@ impl UsbBus {
         self.init_rx_buffer(regs);
         self.init_tx_buffers(regs);
 
-        hprintln!("clearing pending device interrupts").unwrap();
         self.clear_pending_device_interrupts(regs);
 
-        hprintln!("resetting in").unwrap();
         self.in_endpoints.iter().for_each(|ep| ep.reset(&regs.otg_fs_device));
-        hprintln!("resetting out").unwrap();
         self.out_endpoints.iter().for_each(|ep| ep.reset(&regs.otg_fs_device));
 
-        hprintln!("enabling in endpoints").unwrap();
         self.in_endpoints.iter()
             .filter(|ep| ep.configuration.is_some())
             .for_each(|ep| ep.enable(&regs.otg_fs_device));
 
-        hprintln!("enabling out endpoints").unwrap();
         self.out_endpoints.iter()
             .filter(|ep| ep.configuration.is_some())
             .for_each(|ep| ep.enable(&regs.otg_fs_device));
 
-        hprintln!("enabling device interrupts").unwrap();
         self.enable_device_interrupts(regs);
     }
 
@@ -502,18 +483,13 @@ impl UsbBusTrait for UsbBus {
         interrupt::free(|cs| {
             let regs = self.regs.lock(cs);
 
-            hprintln!("disabling global interrupt").unwrap();
             self.disable_global_interrupt(&regs);
-            hprintln!("initializing core").unwrap();
 
             self.init_core(&regs);
-            hprintln!("setting device mode").unwrap();
 
             self.set_device_mode(&regs);
-            hprintln!("initializing device core").unwrap();
 
             self.init_device_core(&regs);
-            hprintln!("enabling global interrupt").unwrap();
 
             self.enable_global_interrupt(&regs);
         });
@@ -710,8 +686,6 @@ impl UsbBusTrait for UsbBus {
     /// Gets information about events and incoming data. Usually called in a loop or from an
     /// interrupt handler. See the [`PollResult`] struct for more information.
     fn poll(&self) -> PollResult {
-        hprintln!("poll called, reading interrupts").unwrap();
-
         interrupt::free(|cs| {
             let regs = self.regs.lock(cs);
             let interrupts = &regs.otg_fs_global.fs_gintsts;
@@ -719,7 +693,6 @@ impl UsbBusTrait for UsbBus {
 
             if current.usbrst().bit_is_set() {
                 interrupts.modify(|_, w| w.usbrst().clear_bit());
-                hprintln!("reset received").unwrap();
                 return PollResult::Reset;
             }
 
@@ -729,8 +702,6 @@ impl UsbBusTrait for UsbBus {
                 match &self.waiting_read.lock(cs).waiting_packet_info {
                     Some(info) => {
                         if info.pktsts().bits() == 6 {
-                            hprintln!("setup packet received").unwrap();
-
                             return PollResult::Data {
                                 ep_setup: (1 << info.epnum().bits()) as u16,
                                 ep_in_complete: 0,
@@ -739,8 +710,6 @@ impl UsbBusTrait for UsbBus {
                         }
 
                         if info.pktsts().bits() == 2 {
-                            hprintln!("data packet received").unwrap();
-
                             return PollResult::Data {
                                 ep_out: (1 << info.epnum().bits()) as u16,
                                 ep_in_complete: 0,
@@ -769,8 +738,6 @@ impl UsbBusTrait for UsbBus {
                         }
                     }
 
-                    hprintln!("transfer complete").unwrap();
-
                     return PollResult::Data {
                         ep_in_complete: ep_bits,
                         ep_out: 0,
@@ -781,17 +748,13 @@ impl UsbBusTrait for UsbBus {
 
             if current.usbsusp().bit_is_set() {
                 interrupts.modify(|_, w| w.usbsusp().clear_bit());
-                hprintln!("suspend received").unwrap();
                 return PollResult::Suspend;
             }
 
             if current.wkupint().bit_is_set() {
                 interrupts.modify(|_, w| w.wkupint().clear_bit());
-                hprintln!("wakeup received").unwrap();
                 return PollResult::Resume;
             }
-
-            hprintln!("no event").unwrap();
 
             PollResult::None
         })

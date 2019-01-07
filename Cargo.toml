@@ -12,4 +12,3 @@ usb-device = { path = "../usb-device" }
 #stm32f4 = { version = "0.5.0", features = ["stm32f429"] }
 #stm32f4xx-hal = { version = "0.2.8", features = ["stm32f429"] }
 stm32f4xx-hal = { path = "../stm32f4xx-hal", features = ["stm32f429"] }
-cortex-m-semihosting = "0.3.2"
