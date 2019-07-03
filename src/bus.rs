@@ -2,6 +2,7 @@ use core::mem;
 use crate::helpers::*;
 use crate::atomic_mutex::AtomicMutex;
 use bare_metal::CriticalSection;
+use fiprintln::fiprintln;
 use cortex_m::interrupt;
 use cortex_m::asm::delay;
 use crate::endpoint::{Endpoint, InEndpoint, OutEndpoint, EndpointConfiguration, NUM_ENDPOINTS};
@@ -9,10 +10,11 @@ use usb_device::bus::UsbBus as UsbBusTrait;
 use usb_device::bus::{PollResult, UsbBusAllocator};
 use usb_device::endpoint::{EndpointAddress, EndpointType};
 use usb_device::{UsbDirection, UsbError, Result};
-use stm32f4xx_hal::stm32f4::stm32f429::{OTG_FS_DEVICE, OTG_FS_GLOBAL, OTG_FS_PWRCLK, otg_fs_global::FS_GRXSTSR_DEVICE, otg_fs_global::fs_grxstsr_device::{DPIDR, PKTSTSR}};
-use stm32f4xx_hal::stm32f4::stm32f429::otg_fs_global::fs_grxstsr_device::R as GrxstsrReg;
-use stm32f4xx_hal::gpio::{gpioa, gpiob, Alternate, AF12, AF10};
-use cortex_m_semihosting::hprintln;
+use stm32f4xx_hal::stm32f429_public::{OTG_HS_DEVICE, OTG_HS_GLOBAL, OTG_HS_PWRCLK, otg_hs_global::{OTG_HS_GRXSTSR_PERIPHERAL, OTG_HS_GRXSTSP_HOST, OTG_HS_GRXSTSR_HOST, OTG_HS_GRXSTSP_PERIPHERAL, OTG_HS_GNPTXFSIZ_HOST, OTG_HS_TX0FSIZ_PERIPHERAL}, otg_fs_global::fs_grxstsr_device::{DPIDR, PKTSTSR}};
+use stm32f4xx_hal::stm32f429_public::otg_hs_global::otg_hs_grxstsr_peripheral::R as GrxstsrReg;
+use stm32f4xx_hal::stm32f429_public::otg_hs_global::otg_hs_grxstsp_peripheral::R as GrxstspReg;
+use stm32f4xx_hal::gpio::{gpioa, gpiob, Alternate, AF12, AF10, Input, Floating};
+use stm32f4xx_hal::hal;
 
 pub struct UsbBus {
     regs: AtomicMutex<UsbRegs>,
@@ -25,18 +27,19 @@ pub struct UsbBus {
 
 struct WaitingPacketInfoWrapper {
     //    waiting_packet_info: Option<WaitingPacketInfo>
-    waiting_packet_info: Option<GrxstsrReg>
+    waiting_packet_info: Option<GrxstspReg>
 }
 
 pub struct UsbRegs {
-    otg_fs_global: OTG_FS_GLOBAL,
-    otg_fs_device: OTG_FS_DEVICE,
-    otg_fs_pwrclk: OTG_FS_PWRCLK,
+    otg_hs_global: OTG_HS_GLOBAL,
+    otg_hs_device: OTG_HS_DEVICE,
+    otg_hs_pwrclk: OTG_HS_PWRCLK,
 }
 
 pub struct GpioPins {
-    dm: gpioa::PA11<Alternate<AF10>>,
-    dp: gpioa::PA12<Alternate<AF10>>,
+    dp: gpiob::PB15<Alternate<AF12>>,
+    dm: gpiob::PB14<Alternate<AF12>>,
+    vbus: gpiob::PB13<Input<Floating>>,
 }
 
 //struct WaitingPacketInfo {
@@ -100,22 +103,23 @@ pub struct GpioPins {
 //}
 
 impl UsbBus {
-    pub fn new(otg_fs_global: OTG_FS_GLOBAL,
-               otg_fs_device: OTG_FS_DEVICE,
-               otg_fs_pwrclk: OTG_FS_PWRCLK,
-               dm_pin: gpioa::PA11<Alternate<AF10>>,
-               dp_pin: gpioa::PA12<Alternate<AF10>>,
+    pub fn new(otg_hs_global: OTG_HS_GLOBAL,
+               otg_hs_device: OTG_HS_DEVICE,
+               otg_hs_pwrclk: OTG_HS_PWRCLK,
+               dp_pin: gpiob::PB15<Alternate<AF12>>,
+               dm_pin: gpiob::PB14<Alternate<AF12>>,
+               vbus_pin: gpiob::PB13<Input<Floating>>,
     ) -> UsbBusAllocator<Self> {
-        hprintln!("initializing usb").unwrap();
         let bus = UsbBus {
             regs: AtomicMutex::new(UsbRegs {
-                otg_fs_global,
-                otg_fs_device,
-                otg_fs_pwrclk,
+                otg_hs_global,
+                otg_hs_device,
+                otg_hs_pwrclk,
             }),
             gpio_pins: AtomicMutex::new(GpioPins {
                 dm: dm_pin,
                 dp: dp_pin,
+                vbus: vbus_pin,
             }),
             in_endpoints: unsafe {
                 let mut in_ep: [InEndpoint; NUM_ENDPOINTS] = mem::uninitialized();
@@ -139,10 +143,7 @@ impl UsbBus {
             waiting_read: AtomicMutex::new(WaitingPacketInfoWrapper { waiting_packet_info: None }),
         };
 
-        hprintln!("calling usb bus allocator").unwrap();
-
         let usbbus = UsbBusAllocator::new(bus);
-        hprintln!("usb bus allocator called").unwrap();
 
         usbbus
     }
@@ -151,11 +152,11 @@ impl UsbBus {
     const FIFO_SIZE: u16 = 320;
 
     fn disable_global_interrupt(&self, regs: &UsbRegs) {
-        regs.otg_fs_global.fs_gahbcfg.modify(|_, w| w.gint().clear_bit());
+        regs.otg_hs_global.otg_hs_gahbcfg.modify(|_, w| w.gint().clear_bit());
     }
 
     fn enable_global_interrupt(&self, regs: &UsbRegs) {
-        regs.otg_fs_global.fs_gahbcfg.modify(|_, w| w.gint().set_bit());
+        regs.otg_hs_global.otg_hs_gahbcfg.modify(|_, w| w.gint().set_bit());
     }
 
     fn init_rx_buffer(&self, regs: &UsbRegs) {
@@ -164,12 +165,12 @@ impl UsbBus {
         let buf_size_raw = 10 + 1 + (2 * (self.max_rx_packet_size / 4)) + 1 + (enabled_out_ep_count as u16);
         let buf_size = clamp(16u16, buf_size_raw, 512u16);
 
-        regs.otg_fs_global.fs_grxfsiz.write(|w| unsafe { w.rxfd().bits(buf_size) });
+        regs.otg_hs_global.otg_hs_grxfsiz.write(|w| unsafe { w.rxfd().bits(buf_size) });
 
         self.flush_rx_fifo(regs);
     }
 
-    fn init_tx_buffers(&self, regs: &UsbRegs) {
+    unsafe fn init_tx_buffers(&self, regs: &UsbRegs) {
         self.in_endpoints.iter().filter(|ep| ep.configuration.is_some()).for_each(|ep| {
             let buf_size = clamp(16, (ep.configuration.as_ref().unwrap().max_packet_size + 3) / 4, 256);
         });
@@ -182,20 +183,28 @@ impl UsbBus {
             unsafe {
                 match ep.index() {
                     0 => {
-                        regs.otg_fs_global.fs_gnptxfsiz_device.write(|w| w.tx0fd().bits(buf_size).tx0fsa().bits(fifo_head));
-                        regs.otg_fs_device.fs_diepctl0.modify(|_, w| w.txfnum().bits(ep.index()))
+                        mem::transmute::<&OTG_HS_GNPTXFSIZ_HOST, &OTG_HS_TX0FSIZ_PERIPHERAL>(&regs.otg_hs_global.otg_hs_gnptxfsiz_host).write(|w| w.tx0fd().bits(buf_size).tx0fsa().bits(fifo_head));
+                        regs.otg_hs_device.otg_hs_diepctl0.modify(|_, w| w.txfnum().bits(ep.index()))
                     }
                     1 => {
-                        regs.otg_fs_global.fs_dieptxf1.write(|w| w.ineptxfd().bits(buf_size).ineptxsa().bits(fifo_head));
-                        regs.otg_fs_device.diepctl1.modify(|_, w| w.txfnum().bits(ep.index()))
+                        regs.otg_hs_global.otg_hs_dieptxf1.write(|w| w.ineptxfd().bits(buf_size).ineptxsa().bits(fifo_head));
+                        regs.otg_hs_device.otg_hs_diepctl1.modify(|_, w| w.txfnum().bits(ep.index()))
                     }
                     2 => {
-                        regs.otg_fs_global.fs_dieptxf2.write(|w| w.ineptxfd().bits(buf_size).ineptxsa().bits(fifo_head));
-                        regs.otg_fs_device.diepctl2.modify(|_, w| w.txfnum().bits(ep.index()))
+                        regs.otg_hs_global.otg_hs_dieptxf2.write(|w| w.ineptxfd().bits(buf_size).ineptxsa().bits(fifo_head));
+                        regs.otg_hs_device.otg_hs_diepctl2.modify(|_, w| w.txfnum().bits(ep.index()))
                     }
                     3 => {
-                        regs.otg_fs_global.fs_dieptxf3.write(|w| w.ineptxfd().bits(buf_size).ineptxsa().bits(fifo_head));
-                        regs.otg_fs_device.diepctl3.modify(|_, w| w.txfnum().bits(ep.index()))
+                        regs.otg_hs_global.otg_hs_dieptxf3.write(|w| w.ineptxfd().bits(buf_size).ineptxsa().bits(fifo_head));
+                        regs.otg_hs_device.otg_hs_diepctl3.modify(|_, w| w.txfnum().bits(ep.index()))
+                    }
+                    4 => {
+                        regs.otg_hs_global.otg_hs_dieptxf4.write(|w| w.ineptxfd().bits(buf_size).ineptxsa().bits(fifo_head));
+                        regs.otg_hs_device.otg_hs_diepctl4.modify(|_, w| w.txfnum().bits(ep.index()))
+                    }
+                    5 => {
+                        regs.otg_hs_global.otg_hs_dieptxf5.write(|w| w.ineptxfd().bits(buf_size).ineptxsa().bits(fifo_head));
+                        regs.otg_hs_device.otg_hs_diepctl5.modify(|_, w| w.txfnum().bits(ep.index()))
                     }
                     _ => unreachable!()
                 }
@@ -205,16 +214,18 @@ impl UsbBus {
         self.flush_tx_fifos(regs);
     }
 
-    fn calculate_fifo_head(&self, regs: &UsbRegs, next_index: u8) -> u16 {
-        let mut size = regs.otg_fs_global.fs_grxfsiz.read().rxfd().bits();
+    unsafe fn calculate_fifo_head(&self, regs: &UsbRegs, next_index: u8) -> u16 {
+        let mut size = regs.otg_hs_global.otg_hs_grxfsiz.read().rxfd().bits();
 
         // this expects that fifos are ordered and span continuous block of memory
         for i in 0..next_index {
             size += match i {
-                0 => regs.otg_fs_global.fs_gnptxfsiz_device.read().tx0fd().bits(),
-                1 => regs.otg_fs_global.fs_dieptxf1.read().ineptxfd().bits(),
-                2 => regs.otg_fs_global.fs_dieptxf2.read().ineptxfd().bits(),
-                3 => regs.otg_fs_global.fs_dieptxf3.read().ineptxfd().bits(),
+                0 => mem::transmute::<&OTG_HS_GNPTXFSIZ_HOST, &OTG_HS_TX0FSIZ_PERIPHERAL>(&regs.otg_hs_global.otg_hs_gnptxfsiz_host).read().tx0fd().bits(),
+                1 => regs.otg_hs_global.otg_hs_dieptxf1.read().ineptxfd().bits(),
+                2 => regs.otg_hs_global.otg_hs_dieptxf2.read().ineptxfd().bits(),
+                3 => regs.otg_hs_global.otg_hs_dieptxf3.read().ineptxfd().bits(),
+                4 => regs.otg_hs_global.otg_hs_dieptxf4.read().ineptxfd().bits(),
+                5 => regs.otg_hs_global.otg_hs_dieptxf5.read().ineptxfd().bits(),
                 _ => unreachable!()
             };
         }
@@ -224,55 +235,46 @@ impl UsbBus {
 
     // todo: check if core is not using the fifo before flushing
     fn flush_tx_fifos(&self, regs: &UsbRegs) {
-        regs.otg_fs_global.fs_grstctl.modify(|_, w| unsafe { w.txfnum().bits(0b10000).txfflsh().set_bit() });
+        regs.otg_hs_global.otg_hs_grstctl.modify(|_, w| unsafe { w.txfnum().bits(0b10000).txfflsh().set_bit() });
 
-        hprintln!("waiting for tx fifos to flush").unwrap();
-
-        while regs.otg_fs_global.fs_grstctl.read().txfflsh().bit_is_set() {}
+        while regs.otg_hs_global.otg_hs_grstctl.read().txfflsh().bit_is_set() {}
 
         delay(60);
     }
 
     fn flush_tx_fifo(&self, regs: &UsbRegs, ep_num: u8) {
-        regs.otg_fs_global.fs_grstctl.modify(|_, w| unsafe { w.txfnum().bits(ep_num).txfflsh().set_bit() });
+        regs.otg_hs_global.otg_hs_grstctl.modify(|_, w| unsafe { w.txfnum().bits(ep_num).txfflsh().set_bit() });
 
-        hprintln!("waiting for tx fifo to flush").unwrap();
-
-        while regs.otg_fs_global.fs_grstctl.read().txfflsh().bit_is_set() {}
+        while regs.otg_hs_global.otg_hs_grstctl.read().txfflsh().bit_is_set() {}
 
         delay(60);
     }
 
     fn flush_rx_fifo(&self, regs: &UsbRegs) {
-        regs.otg_fs_global.fs_grstctl.modify(|_, w| w.rxfflsh().set_bit());
+        regs.otg_hs_global.otg_hs_grstctl.modify(|_, w| w.rxfflsh().set_bit());
 
-        hprintln!("waiting for rx fifo to flush").unwrap();
-
-        while regs.otg_fs_global.fs_grstctl.read().rxfflsh().bit_is_set() {}
+        while regs.otg_hs_global.otg_hs_grstctl.read().rxfflsh().bit_is_set() {}
 
         delay(60);
     }
 
     fn reset_core(&self, regs: &UsbRegs) {
-        hprintln!("waiting for ahb to become idle").unwrap();
         // wait for AHB to become idle
-        while regs.otg_fs_global.fs_grstctl.read().ahbidl().bit_is_clear() {}
+        while regs.otg_hs_global.otg_hs_grstctl.read().ahbidl().bit_is_clear() {}
 
-        hprintln!("resetting core").unwrap();
-        regs.otg_fs_global.fs_grstctl.modify(|_, w| w.csrst().set_bit());
+        regs.otg_hs_global.otg_hs_grstctl.modify(|_, w| w.csrst().set_bit());
 
-        hprintln!("waiting for core to reset").unwrap();
-        while regs.otg_fs_global.fs_grstctl.read().csrst().bit_is_set() {}
+        while regs.otg_hs_global.otg_hs_grstctl.read().csrst().bit_is_set() {}
     }
 
     fn init_phy(&self, regs: &UsbRegs) {
         // this probably has no effect
-        regs.otg_fs_global.fs_gusbcfg.write(|w| w.physel().set_bit());
+        regs.otg_hs_global.otg_hs_gusbcfg.write(|w| w.physel().set_bit());
 
         self.reset_core(regs);
 
         // activate transceiver
-        regs.otg_fs_global.fs_gccfg.modify(|_, w| w.pwrdwn().set_bit());
+        regs.otg_hs_global.otg_hs_gccfg.modify(|_, w| w.pwrdwn().set_bit());
 
         delay(60);
     }
@@ -283,114 +285,120 @@ impl UsbBus {
         // DMA and OTG init goes there once possible
     }
 
-    fn init_device_core(&self, regs: &UsbRegs) {
+    unsafe fn init_device_core(&self, regs: &UsbRegs) {
         // Restart the Phy Clock
         // fixme: that's how ST does it... but what?!
-        regs.otg_fs_pwrclk.fs_pcgcctl.modify(|_, w| unsafe { w.bits(0) });
+        regs.otg_hs_pwrclk.otg_hs_pcgcctl.modify(|_, w| unsafe { w.bits(0) });
 
-        // periodic frame interval = 80% & device speed = FS
-        regs.otg_fs_device.fs_dcfg.modify(|_, w| unsafe { w.pfivl().bits(0b0).dspd().bits(3) });
+        // Enable VBUS sensing for B (peripheral) mode
+        regs.otg_hs_global.otg_hs_gccfg.modify(|_, w| w.vbusbsen().set_bit());
+
+        // periodic frame interval = 80% & device speed = FS with integrated PHY
+        regs.otg_hs_device.otg_hs_dcfg.modify(|_, w| unsafe { w.pfivl().bits(0b0).dspd().bits(0b11) });
 
         self.init_rx_buffer(regs);
         self.init_tx_buffers(regs);
 
-        hprintln!("clearing pending device interrupts").unwrap();
         self.clear_pending_device_interrupts(regs);
 
-        hprintln!("resetting in").unwrap();
-        self.in_endpoints.iter().for_each(|ep| ep.reset(&regs.otg_fs_device));
-        hprintln!("resetting out").unwrap();
-        self.out_endpoints.iter().for_each(|ep| ep.reset(&regs.otg_fs_device));
+        self.in_endpoints.iter().for_each(|ep| ep.reset(&regs.otg_hs_device));
+        self.out_endpoints.iter().for_each(|ep| ep.reset(&regs.otg_hs_device));
 
-        hprintln!("enabling in endpoints").unwrap();
         self.in_endpoints.iter()
             .filter(|ep| ep.configuration.is_some())
-            .for_each(|ep| ep.enable(&regs.otg_fs_device));
+            .for_each(|ep| ep.enable(&regs.otg_hs_device));
 
-        hprintln!("enabling out endpoints").unwrap();
         self.out_endpoints.iter()
             .filter(|ep| ep.configuration.is_some())
-            .for_each(|ep| ep.enable(&regs.otg_fs_device));
+            .for_each(|ep| ep.enable(&regs.otg_hs_device));
 
-        hprintln!("enabling device interrupts").unwrap();
         self.enable_device_interrupts(regs);
     }
 
     fn set_device_mode(&self, regs: &UsbRegs) {
-        regs.otg_fs_global.fs_gusbcfg.modify(|_, w| w.fdmod().set_bit());
+        regs.otg_hs_global.otg_hs_gusbcfg.modify(|_, w| w.fdmod().set_bit());
 
         // 50ms delay
         delay(50 * 12 * 1000);
     }
 
     fn clear_pending_device_interrupts(&self, regs: &UsbRegs) {
-        regs.otg_fs_device.fs_diepmsk.reset();
-        regs.otg_fs_device.fs_doepmsk.reset();
+        regs.otg_hs_device.otg_hs_diepmsk.reset();
+        regs.otg_hs_device.otg_hs_doepmsk.reset();
+        regs.otg_hs_device.otg_hs_diepempmsk.reset();
 //        regs.otg_fs_device.fs_daint.write(|w| unsafe { w.bits(0xFFFFFFFF) });
-        regs.otg_fs_device.fs_daintmsk.reset();
+        regs.otg_hs_device.otg_hs_daintmsk.reset();
     }
 
     fn enable_device_interrupts(&self, regs: &UsbRegs) {
-        regs.otg_fs_global.fs_gintmsk.write(|w| unsafe { w.bits(0) });
-        regs.otg_fs_global.fs_gintsts.write(|w| unsafe { w.bits(0xBFFFFFFF) });
+        regs.otg_hs_global.otg_hs_gintmsk.write(|w| unsafe { w.bits(0) });
+        regs.otg_hs_global.otg_hs_gintsts.write(|w| unsafe { w.bits(0xBFFFFFFF) });
 
-        regs.otg_fs_global.fs_gintmsk.write(|w| w
+        regs.otg_hs_global.otg_hs_gintmsk.write(|w| w
             .wuim().set_bit()
             .rxflvlm().set_bit()
             .usbsuspm().set_bit()
             .usbrst().set_bit()
 //            .enumdnem().set_bit()
             .iepint().set_bit()
-//            .oepint().set_bit()
+            .oepint().set_bit()
         );
 
-        regs.otg_fs_device.fs_diepmsk.write(|w| w.xfrcm().set_bit());
+        regs.otg_hs_device.otg_hs_diepmsk.write(|w| w.xfrcm().set_bit());
 //        regs.otg_fs_device.fs_doepmsk.write(|w| w.xfrcm().set_bit());
     }
 
-    fn read_packet_status(&self, _cs: &CriticalSection) -> Option<GrxstsrReg> {
-        let grxstsr = &self.regs.lock(_cs).otg_fs_global.fs_grxstsr_device;
-        let grxstsp = unsafe {
-            let grxstsr_ptr = grxstsr as *const FS_GRXSTSR_DEVICE;
+    unsafe fn read_packet_status(&self, regs: &UsbRegs, _cs: &CriticalSection) -> Option<GrxstspReg> {
+        // fiprintln!("reading packet status");
 
-            &*grxstsr_ptr.offset(1)
-        };
+        let grxstsp = mem::transmute::<&OTG_HS_GRXSTSP_HOST, &OTG_HS_GRXSTSP_PERIPHERAL>(&regs.otg_hs_global.otg_hs_grxstsp_host);
+//        let grxstsr = mem::transmute::<&OTG_HS_GRXSTSR_HOST, &OTG_HS_GRXSTSR_PERIPHERAL>(&self.regs.lock(_cs).otg_hs_global.otg_hs_grxstsr_host);
 
+        // fiprintln!("got packet status register");
         loop {
             let packet_status = grxstsp.read();
 
             // fifo is empty (can also be checked using RXFLVL interrupt bit)
             if packet_status.bits() == 0 {
+                 fiprintln!("packet status empty");
                 break None;
             }
 
             // setup or data packet received
             if packet_status.pktsts().bits() == 2 || packet_status.pktsts().bits() == 6 {
+                 fiprintln!("retrieved packet status");
                 break Some(packet_status);
             }
         }
     }
 
-    fn update_packet_status(&self, _cs: &CriticalSection) {
+    unsafe fn update_packet_status(&self, regs: &UsbRegs, _cs: &CriticalSection) {
+        // fiprintln!("updating packet status");
         let mut container = self.waiting_read.lock(_cs);
 
         if container.waiting_packet_info.is_none() {
-            container.waiting_packet_info = self.read_packet_status(_cs);
+            fiprintln!("no previous packet, reading new packet status");
+            container.waiting_packet_info = self.read_packet_status(regs, _cs);
         }
     }
 
     fn enable_stall(&self, regs: &UsbRegs, ep_addr: EndpointAddress) {
         // todo: do it properly, should wait for epdis to take effect and flush tx fifo
+        fiprintln!("stall: enable");
 
         match (ep_addr.direction(), ep_addr.index()) {
-            (UsbDirection::In, 0) => regs.otg_fs_device.fs_diepctl0.modify(|_, w| w.stall().set_bit()),
-            (UsbDirection::In, 1) => regs.otg_fs_device.diepctl1.modify(|_, w| w.epdis().set_bit().stall().set_bit()),
-            (UsbDirection::In, 2) => regs.otg_fs_device.diepctl1.modify(|_, w| w.epdis().set_bit().stall().set_bit()),
-            (UsbDirection::In, 3) => regs.otg_fs_device.diepctl1.modify(|_, w| w.epdis().set_bit().stall().set_bit()),
-            (UsbDirection::Out, 0) => regs.otg_fs_device.doepctl0.modify(|_, w| w.stall().set_bit()),
-            (UsbDirection::Out, 1) => regs.otg_fs_device.doepctl1.modify(|_, w| w.epdis().set_bit().stall().set_bit()),
-            (UsbDirection::Out, 2) => regs.otg_fs_device.doepctl1.modify(|_, w| w.epdis().set_bit().stall().set_bit()),
-            (UsbDirection::Out, 3) => regs.otg_fs_device.doepctl1.modify(|_, w| w.epdis().set_bit().stall().set_bit()),
+            (UsbDirection::In, 0) => regs.otg_hs_device.otg_hs_diepctl0.modify(|_, w| w.stall().set_bit()),
+            (UsbDirection::In, 1) => regs.otg_hs_device.otg_hs_diepctl1.modify(|_, w| w.epdis().set_bit().stall().set_bit()),
+            (UsbDirection::In, 2) => regs.otg_hs_device.otg_hs_diepctl2.modify(|_, w| w.epdis().set_bit().stall().set_bit()),
+            (UsbDirection::In, 3) => regs.otg_hs_device.otg_hs_diepctl3.modify(|_, w| w.epdis().set_bit().stall().set_bit()),
+            (UsbDirection::In, 4) => regs.otg_hs_device.otg_hs_diepctl4.modify(|_, w| w.epdis().set_bit().stall().set_bit()),
+            (UsbDirection::In, 5) => regs.otg_hs_device.otg_hs_diepctl5.modify(|_, w| w.epdis().set_bit().stall().set_bit()),
+            (UsbDirection::Out, 0) => regs.otg_hs_device.otg_hs_doepctl0.modify(|_, w| w.stall().set_bit()),
+            (UsbDirection::Out, 1) => regs.otg_hs_device.otg_hs_doepctl1.modify(|_, w| w.epdis().set_bit().stall().set_bit()),
+            (UsbDirection::Out, 2) => regs.otg_hs_device.otg_hs_doepctl2.modify(|_, w| w.epdis().set_bit().stall().set_bit()),
+            (UsbDirection::Out, 3) => regs.otg_hs_device.otg_hs_doepctl3.modify(|_, w| w.epdis().set_bit().stall().set_bit()),
+            (UsbDirection::Out, 4) => regs.otg_hs_device.otg_hs_doepctl4.modify(|_, w| w.epdis().set_bit().stall().set_bit()),
+            (UsbDirection::Out, 5) => regs.otg_hs_device.otg_hs_doepctl5.modify(|_, w| w.epdis().set_bit().stall().set_bit()),
             (_, _) => unreachable!()
         };
 
@@ -400,15 +408,21 @@ impl UsbBus {
     }
 
     fn disable_stall(&self, regs: &UsbRegs, ep_addr: EndpointAddress) {
+        fiprintln!("stall: disable");
+
         match (ep_addr.direction(), ep_addr.index()) {
-            (UsbDirection::In, 0) => regs.otg_fs_device.fs_diepctl0.modify(|_, w| w.stall().clear_bit()),
-            (UsbDirection::In, 1) => regs.otg_fs_device.diepctl1.modify(|_, w| w.stall().clear_bit().sd0pid_sevnfrm().set_bit()),
-            (UsbDirection::In, 2) => regs.otg_fs_device.diepctl1.modify(|_, w| w.stall().clear_bit().sd0pid_sevnfrm().set_bit()),
-            (UsbDirection::In, 3) => regs.otg_fs_device.diepctl1.modify(|_, w| w.stall().clear_bit().sd0pid_sevnfrm().set_bit()),
-            (UsbDirection::Out, 0) => regs.otg_fs_device.doepctl0.modify(|_, w| w.stall().clear_bit()),
-            (UsbDirection::Out, 1) => regs.otg_fs_device.doepctl1.modify(|_, w| w.stall().clear_bit().sd0pid_sevnfrm().set_bit()),
-            (UsbDirection::Out, 2) => regs.otg_fs_device.doepctl1.modify(|_, w| w.stall().clear_bit().sd0pid_sevnfrm().set_bit()),
-            (UsbDirection::Out, 3) => regs.otg_fs_device.doepctl1.modify(|_, w| w.stall().clear_bit().sd0pid_sevnfrm().set_bit()),
+            (UsbDirection::In, 0) => regs.otg_hs_device.otg_hs_diepctl0.modify(|_, w| w.stall().clear_bit()),
+            (UsbDirection::In, 1) => regs.otg_hs_device.otg_hs_diepctl1.modify(|_, w| w.stall().clear_bit().sd0pid_sevnfrm().set_bit()),
+            (UsbDirection::In, 2) => regs.otg_hs_device.otg_hs_diepctl2.modify(|_, w| w.stall().clear_bit().sd0pid_sevnfrm().set_bit()),
+            (UsbDirection::In, 3) => regs.otg_hs_device.otg_hs_diepctl3.modify(|_, w| w.stall().clear_bit().sd0pid_sevnfrm().set_bit()),
+            (UsbDirection::In, 4) => regs.otg_hs_device.otg_hs_diepctl4.modify(|_, w| w.stall().clear_bit().sd0pid_sevnfrm().set_bit()),
+            (UsbDirection::In, 5) => regs.otg_hs_device.otg_hs_diepctl5.modify(|_, w| w.stall().clear_bit().sd0pid_sevnfrm().set_bit()),
+            (UsbDirection::Out, 0) => regs.otg_hs_device.otg_hs_doepctl0.modify(|_, w| w.stall().clear_bit()),
+            (UsbDirection::Out, 1) => regs.otg_hs_device.otg_hs_doepctl1.modify(|_, w| w.stall().clear_bit().sd0pid_sevnfrm().set_bit()),
+            (UsbDirection::Out, 2) => regs.otg_hs_device.otg_hs_doepctl2.modify(|_, w| w.stall().clear_bit().sd0pid_sevnfrm().set_bit()),
+            (UsbDirection::Out, 3) => regs.otg_hs_device.otg_hs_doepctl3.modify(|_, w| w.stall().clear_bit().sd0pid_sevnfrm().set_bit()),
+            (UsbDirection::Out, 4) => regs.otg_hs_device.otg_hs_doepctl4.modify(|_, w| w.stall().clear_bit().sd0pid_sevnfrm().set_bit()),
+            (UsbDirection::Out, 5) => regs.otg_hs_device.otg_hs_doepctl5.modify(|_, w| w.stall().clear_bit().sd0pid_sevnfrm().set_bit()),
             (_, _) => unreachable!()
         };
     }
@@ -416,14 +430,32 @@ impl UsbBus {
     fn next_free_endpoint(&self, ep_dir: UsbDirection) -> Option<EndpointAddress> {
         match ep_dir {
             UsbDirection::In =>
-                self.in_endpoints.iter()
+                self.in_endpoints[1..].iter()
                     .find(|ep| ep.configuration.is_none())
                     .and_then(|ep| Some(EndpointAddress::from_parts(ep.index() as usize, ep_dir))),
             UsbDirection::Out =>
-                self.out_endpoints.iter()
+                self.out_endpoints[1..].iter()
                     .find(|ep| ep.configuration.is_none())
                     .and_then(|ep| Some(EndpointAddress::from_parts(ep.index() as usize, ep_dir)))
         }
+    }
+
+    fn read_in_ep_interrupts(&self, regs: &UsbRegs, ep_num: u8) -> u32 {
+        let in_interrupt_mask = regs.otg_hs_device.otg_hs_diepmsk.read().bits();
+        let empty_fifo_interrupt_mask = regs.otg_hs_device.otg_hs_diepempmsk.read().bits();
+        let final_mask = in_interrupt_mask | ((empty_fifo_interrupt_mask >> ep_num) & 0b1) << 7; // 7 is TXFE bit
+
+        let unmasked_interrupts = match ep_num {
+            0 => regs.otg_hs_device.otg_hs_diepint0.read().bits(),
+            1 => regs.otg_hs_device.otg_hs_diepint1.read().bits(),
+            2 => regs.otg_hs_device.otg_hs_diepint2.read().bits(),
+            3 => regs.otg_hs_device.otg_hs_diepint3.read().bits(),
+            4 => regs.otg_hs_device.otg_hs_diepint4.read().bits(),
+            5 => regs.otg_hs_device.otg_hs_diepint5.read().bits(),
+            _ => unreachable!()
+        };
+
+        unmasked_interrupts & final_mask
     }
 }
 
@@ -455,34 +487,39 @@ impl UsbBusTrait for UsbBus {
         ep_type: EndpointType,
         max_packet_size: u16,
         interval: u8) -> Result<EndpointAddress> {
-        if ep_addr.is_some() && ep_addr.unwrap().index() > 3 {
+        if ep_addr.is_some() && ep_addr.unwrap().index() > NUM_ENDPOINTS {
+            fiprintln!("alloc: endpoint overflow");
             return Err(UsbError::EndpointOverflow);
         }
 
         interrupt::free(|cs| {
             let regs = self.regs.lock(cs);
 
-            let result = match (ep_addr, ep_dir) {
-                (None, _) => self.next_free_endpoint(ep_dir).ok_or(UsbError::EndpointOverflow),
-                (Some(addr), UsbDirection::In) => {
-                    let ep = &mut self.in_endpoints[addr.index()];
+            let ep_addr_assigned = match ep_addr {
+                Some(addr) => addr,
+                None => self.next_free_endpoint(ep_dir).ok_or(UsbError::EndpointOverflow)?
+            };
+
+            let result = match ep_dir {
+                UsbDirection::In => {
+                    let ep = &mut self.in_endpoints[ep_addr_assigned.index()];
 
                     match ep.configuration {
                         Some(_) => Err(UsbError::InvalidEndpoint),
                         None => {
                             ep.configuration.replace(EndpointConfiguration { ep_type, max_packet_size });
-                            Ok(addr)
+                            Ok(EndpointAddress::from_parts(ep.index() as usize, UsbDirection::In))
                         }
                     }
                 }
-                (Some(addr), UsbDirection::Out) => {
-                    let ep = &mut self.out_endpoints[addr.index()];
+                UsbDirection::Out => {
+                    let ep = &mut self.out_endpoints[ep_addr_assigned.index()];
 
                     match ep.configuration {
                         Some(_) => Err(UsbError::InvalidEndpoint),
                         None => {
                             ep.configuration.replace(EndpointConfiguration { ep_type, max_packet_size });
-                            Ok(addr)
+                            Ok(EndpointAddress::from_parts(ep.index() as usize, UsbDirection::Out))
                         }
                     }
                 }
@@ -491,6 +528,11 @@ impl UsbBusTrait for UsbBus {
             if result.is_ok() && ep_dir == UsbDirection::Out && max_packet_size > self.max_rx_packet_size {
                 self.max_rx_packet_size = max_packet_size;
             }
+
+            match result {
+                Ok(res) => fiprintln!("alloc: allocated ep - dir {}, num: {}, type: {}, max pckt size: {}", res.direction() as u8, res.index(), ep_type as u8, max_packet_size),
+                Err(_) => fiprintln!("alloc: ep allocation error")
+            };
 
             result
         })
@@ -502,18 +544,13 @@ impl UsbBusTrait for UsbBus {
         interrupt::free(|cs| {
             let regs = self.regs.lock(cs);
 
-            hprintln!("disabling global interrupt").unwrap();
             self.disable_global_interrupt(&regs);
-            hprintln!("initializing core").unwrap();
 
             self.init_core(&regs);
-            hprintln!("setting device mode").unwrap();
 
             self.set_device_mode(&regs);
-            hprintln!("initializing device core").unwrap();
 
-            self.init_device_core(&regs);
-            hprintln!("enabling global interrupt").unwrap();
+            unsafe { self.init_device_core(&regs); }
 
             self.enable_global_interrupt(&regs);
         });
@@ -524,7 +561,9 @@ impl UsbBusTrait for UsbBus {
     fn reset(&self) {}
 
     /// Sets the device USB address to `addr`.
-    fn set_device_address(&self, addr: u8) {}
+    fn set_device_address(&self, addr: u8) {
+        interrupt::free(|cs| self.regs.lock(cs).otg_hs_device.otg_hs_dcfg.modify(|_, w| unsafe { w.dad().bits(addr) }));
+    }
 
     /// Writes a single packet of data to the specified endpoint and returns number of bytes
     /// actually written.
@@ -546,16 +585,19 @@ impl UsbBusTrait for UsbBus {
     /// Implementations may also return other errors if applicable.
     fn write(&self, ep_addr: EndpointAddress, buf: &[u8]) -> Result<usize> {
         if ep_addr.direction() == UsbDirection::Out {
+            fiprintln!("write: invalid direction");
             return Err(UsbError::InvalidEndpoint);
         }
 
         let ep = &self.in_endpoints[ep_addr.index()];
 
         if ep.configuration.is_none() {
+            fiprintln!("write: not configured");
             return Err(UsbError::InvalidEndpoint);
         }
 
         if buf.len() > ep.configuration.as_ref().unwrap().max_packet_size as usize {
+            fiprintln!("write: buffer overflow");
             return Err(UsbError::BufferOverflow);
         }
 
@@ -567,16 +609,21 @@ impl UsbBusTrait for UsbBus {
                 let regs = self.regs.lock(cs);
 
                 buffer_available = match ep.index() {
-                    0 => regs.otg_fs_device.dtxfsts0.read().ineptfsav().bits() as usize,
-                    1 => regs.otg_fs_device.dtxfsts1.read().ineptfsav().bits() as usize,
-                    2 => regs.otg_fs_device.dtxfsts2.read().ineptfsav().bits() as usize,
-                    3 => regs.otg_fs_device.dtxfsts3.read().ineptfsav().bits() as usize,
+                    0 => regs.otg_hs_device.otg_hs_dtxfsts0.read().ineptfsav().bits() as usize,
+                    1 => regs.otg_hs_device.otg_hs_dtxfsts1.read().ineptfsav().bits() as usize,
+                    2 => regs.otg_hs_device.otg_hs_dtxfsts2.read().ineptfsav().bits() as usize,
+                    3 => regs.otg_hs_device.otg_hs_dtxfsts3.read().ineptfsav().bits() as usize,
+                    4 => regs.otg_hs_device.otg_hs_dtxfsts4.read().ineptfsav().bits() as usize,
+                    5 => regs.otg_hs_device.otg_hs_dtxfsts5.read().ineptfsav().bits() as usize,
                     _ => unreachable!()
                 };
             });
 
+            fiprintln!("ep index: {}, buffer available: {}", ep.index(), buffer_available);
 
-            if (buf.len() + 3) / 4 > buffer_available {
+
+            if ((buf.len() + 3) >> 2) > buffer_available {
+                fiprintln!("write: not enough space in buffer, waiting");
                 return Err(UsbError::WouldBlock);
             }
         }
@@ -587,26 +634,35 @@ impl UsbBusTrait for UsbBus {
             unsafe {
                 match ep.index() {
                     0 => {
-                        regs.otg_fs_device.dieptsiz0.write(|w| w.xfrsiz().bits(buf.len() as u8));
-                        // fixme EP0 EPENA read-only for some reason, hope this works
-                        regs.otg_fs_device.fs_diepctl0.modify(|r, w| w.cnak().set_bit().bits(r.bits() | (1 << 31)))
+                        regs.otg_hs_device.otg_hs_dieptsiz0.write(|w| w.xfrsiz().bits(buf.len() as u8));
+                        regs.otg_hs_device.otg_hs_diepctl0.modify(|r, w| w.cnak().set_bit().epena().set_bit());
                     }
                     1 => {
-                        regs.otg_fs_device.dieptsiz1.write(|w| w.pktcnt().bits(1).xfrsiz().bits(buf.len() as u32));
-                        regs.otg_fs_device.diepctl1.modify(|_, w| w.cnak().set_bit().epena().set_bit());
+                        regs.otg_hs_device.otg_hs_dieptsiz1.write(|w| w.pktcnt().bits(1).xfrsiz().bits(buf.len() as u32));
+                        regs.otg_hs_device.otg_hs_diepctl1.modify(|_, w| w.cnak().set_bit().epena().set_bit());
                     }
                     2 => {
-                        regs.otg_fs_device.dieptsiz2.write(|w| w.pktcnt().bits(1).xfrsiz().bits(buf.len() as u32));
-                        regs.otg_fs_device.diepctl2.modify(|_, w| w.cnak().set_bit().epena().set_bit());
+                        regs.otg_hs_device.otg_hs_dieptsiz2.write(|w| w.pktcnt().bits(1).xfrsiz().bits(buf.len() as u32));
+                        regs.otg_hs_device.otg_hs_diepctl2.modify(|_, w| w.cnak().set_bit().epena().set_bit());
                     }
                     3 => {
-                        regs.otg_fs_device.dieptsiz3.write(|w| w.pktcnt().bits(1).xfrsiz().bits(buf.len() as u32));
-                        regs.otg_fs_device.diepctl3.modify(|_, w| w.cnak().set_bit().epena().set_bit());
+                        regs.otg_hs_device.otg_hs_dieptsiz3.write(|w| w.pktcnt().bits(1).xfrsiz().bits(buf.len() as u32));
+                        regs.otg_hs_device.otg_hs_diepctl3.modify(|_, w| w.cnak().set_bit().epena().set_bit());
+                    }
+                    4 => {
+                        regs.otg_hs_device.otg_hs_dieptsiz4.write(|w| w.pktcnt().bits(1).xfrsiz().bits(buf.len() as u32));
+                        regs.otg_hs_device.otg_hs_diepctl4.modify(|_, w| w.cnak().set_bit().epena().set_bit());
+                    }
+                    5 => {
+                        regs.otg_hs_device.otg_hs_dieptsiz5.write(|w| w.pktcnt().bits(1).xfrsiz().bits(buf.len() as u32));
+                        regs.otg_hs_device.otg_hs_diepctl5.modify(|_, w| w.cnak().set_bit().epena().set_bit());
                     }
                     _ => unreachable!()
                 };
             }
         });
+
+        fiprintln!("write: beginning write");
 
         ep.write(buf)
     }
@@ -631,35 +687,62 @@ impl UsbBusTrait for UsbBus {
     /// Implementations may also return other errors if applicable.
     fn read(&self, ep_addr: EndpointAddress, buf: &mut [u8]) -> Result<usize> {
         if ep_addr.direction() == UsbDirection::In {
+            fiprintln!("read: invalid endpoint");
             return Err(UsbError::InvalidEndpoint);
         }
 
-        let rx_not_empty = interrupt::free(|cs| self.regs.lock(cs).otg_fs_global.fs_gintsts.read().rxflvl().bit_is_clear());
+        let rx_empty = interrupt::free(|cs| self.regs.lock(cs).otg_hs_global.otg_hs_gintsts.read().rxflvl().bit_is_clear());
 
-        if !rx_not_empty {
+        if rx_empty {
+            fiprintln!("read: would block (no packet waiting)");
             return Err(UsbError::WouldBlock);
         }
 
         let ep = &self.out_endpoints[ep_addr.index()];
 
         let byte_count = interrupt::free(|cs| {
-            self.update_packet_status(cs);
+            let regs = self.regs.lock(cs);
+            unsafe { self.update_packet_status(&regs, cs); }
 
             self.waiting_read.lock(cs).waiting_packet_info.as_ref()
                 .ok_or(UsbError::WouldBlock)
                 .and_then(|pi| {
                     if pi.epnum().bits() != ep_addr.index() as u8 {
+                        fiprintln!("read: would block (invalid endpoint address) - packet epnum: {}, ep addr: {}", pi.epnum().bits(), ep_addr.index() as u8);
                         return Err(UsbError::WouldBlock);
                     }
 
-                    Ok(pi.bcnt().bits().clone())
+                    let bytes = pi.bcnt().bits().clone();
+                    fiprintln!("read: {} bytes to read", bytes);
+                    Ok(bytes)
                 })
         });
 
-        let result = byte_count.and_then(|bc| ep.read(buf, bc as usize));
+        if byte_count.is_err() {
+            fiprintln!("read: byte count returned error (failed reading waiting packet)");
+        }
 
-        interrupt::free(|cs| self.waiting_read.lock(cs).waiting_packet_info = None);
+        let result = byte_count.and_then(|bc| {
+            if buf.len() < bc as usize {
+                fiprintln!("read: provided buffer too small");
+                return Err(UsbError::BufferOverflow)
+            }
 
+            Ok(bc)
+        }).and_then(|bc| {
+            fiprintln!("read: beginning reading");
+
+            let read = ep.read(buf, bc as usize);
+
+            fiprintln!("read: setting waiting packet to none");
+
+            interrupt::free(|cs| self.waiting_read.lock(cs).waiting_packet_info = None);
+
+            fiprintln!("read: done reading");
+
+            read
+        });
+        // fiprintln!("read: ok");
         result
     }
 
@@ -685,12 +768,16 @@ impl UsbBusTrait for UsbBus {
 
             match (ep_addr.direction(), ep_addr.index()) {
                 (UsbDirection::In, 0) | (UsbDirection::Out, 0) => false,
-                (UsbDirection::In, 1) => regs.otg_fs_device.diepctl1.read().stall().bit(),
-                (UsbDirection::In, 2) => regs.otg_fs_device.diepctl1.read().stall().bit(),
-                (UsbDirection::In, 3) => regs.otg_fs_device.diepctl1.read().stall().bit(),
-                (UsbDirection::Out, 1) => regs.otg_fs_device.doepctl1.read().stall().bit(),
-                (UsbDirection::Out, 2) => regs.otg_fs_device.doepctl1.read().stall().bit(),
-                (UsbDirection::Out, 3) => regs.otg_fs_device.doepctl1.read().stall().bit(),
+                (UsbDirection::In, 1) => regs.otg_hs_device.otg_hs_diepctl1.read().stall().bit(),
+                (UsbDirection::In, 2) => regs.otg_hs_device.otg_hs_diepctl2.read().stall().bit(),
+                (UsbDirection::In, 3) => regs.otg_hs_device.otg_hs_diepctl3.read().stall().bit(),
+                (UsbDirection::In, 4) => regs.otg_hs_device.otg_hs_diepctl4.read().stall().bit(),
+                (UsbDirection::In, 5) => regs.otg_hs_device.otg_hs_diepctl5.read().stall().bit(),
+                (UsbDirection::Out, 1) => regs.otg_hs_device.otg_hs_doepctl1.read().stall().bit(),
+                (UsbDirection::Out, 2) => regs.otg_hs_device.otg_hs_doepctl2.read().stall().bit(),
+                (UsbDirection::Out, 3) => regs.otg_hs_device.otg_hs_doepctl3.read().stall().bit(),
+                (UsbDirection::Out, 4) => regs.otg_hs_device.otg_hs_doepctl4.read().stall().bit(),
+                (UsbDirection::Out, 5) => regs.otg_hs_device.otg_hs_doepctl5.read().stall().bit(),
                 (_, _) => unreachable!()
             }
         })
@@ -701,46 +788,63 @@ impl UsbBusTrait for UsbBus {
     /// [`poll`](crate::device::UsbDevice::poll) returns [`PollResult::Suspend`]. The device will
     /// continue be polled, and it shall return a value other than `Suspend` from `poll` when it no
     /// longer detects the suspend condition.
-    fn suspend(&self) {}
+    fn suspend(&self) {
+        fiprintln!("suspend called");
+    }
 
     /// Resumes from suspend mode. This may only be called after the peripheral has been previously
     /// suspended.
-    fn resume(&self) {}
+    fn resume(&self) {
+        fiprintln!("resume called");
+    }
 
     /// Gets information about events and incoming data. Usually called in a loop or from an
     /// interrupt handler. See the [`PollResult`] struct for more information.
     fn poll(&self) -> PollResult {
-        hprintln!("poll called, reading interrupts").unwrap();
-
         interrupt::free(|cs| {
             let regs = self.regs.lock(cs);
-            let interrupts = &regs.otg_fs_global.fs_gintsts;
+            let interrupts = &regs.otg_hs_global.otg_hs_gintsts;
             let current = &interrupts.read();
 
+
             if current.usbrst().bit_is_set() {
-                interrupts.modify(|_, w| w.usbrst().clear_bit());
-                hprintln!("reset received").unwrap();
+                interrupts.modify(|_, w| w.usbrst().set_bit());
+                fiprintln!("poll: reset");
                 return PollResult::Reset;
             }
 
+            if current.usbsusp().bit_is_set() {
+                interrupts.modify(|_, w| w.usbsusp().set_bit());
+                fiprintln!("poll: suspend");
+                return PollResult::Suspend;
+            }
+
+            if current.wkuint().bit_is_set() {
+                interrupts.modify(|_, w| w.wkuint().set_bit());
+                fiprintln!("poll: resume");
+                return PollResult::Resume;
+            }
+
             if current.rxflvl().bit_is_set() {
-                self.update_packet_status(cs);
+                fiprintln!("rxflvl read");
+
+                unsafe { self.update_packet_status(&regs, cs); }
+
+                fiprintln!("packet status read");
 
                 match &self.waiting_read.lock(cs).waiting_packet_info {
                     Some(info) => {
-                        if info.pktsts().bits() == 6 {
-                            hprintln!("setup packet received").unwrap();
+                        fiprintln!("waiting packet - ep num: {}, byte count: {}, packet status: {}", info.epnum().bits(), info.bcnt().bits(), info.pktsts().bits());
 
+                        if info.pktsts().bits() == 6 {
+                            fiprintln!("poll: setup");
                             return PollResult::Data {
                                 ep_setup: (1 << info.epnum().bits()) as u16,
                                 ep_in_complete: 0,
                                 ep_out: 0,
                             };
-                        }
-
-                        if info.pktsts().bits() == 2 {
-                            hprintln!("data packet received").unwrap();
-
+                        } else if info.pktsts().bits() == 2 {
+                            fiprintln!("poll: data");
                             return PollResult::Data {
                                 ep_out: (1 << info.epnum().bits()) as u16,
                                 ep_in_complete: 0,
@@ -748,54 +852,49 @@ impl UsbBusTrait for UsbBus {
                             };
                         }
                     }
-                    None => ()
+                    None => {}
                 }
+            }
 
-                if current.iepint().bit_is_set() {
-                    // transfer complete interrupt hit
-                    // fixme: this should check if it actually did
+            if current.iepint().bit_is_set() {
+                fiprintln!("iepint read");
 
-                    let ep_bits = regs.otg_fs_device.fs_daint.read().iepint().bits();
+                // transfer complete interrupt hit
+                // fixme: this should check if it actually did
 
-                    for i in 0..4 {
-                        if (ep_bits & (1 << i)) != 0 {
-                            match i {
-                                0 => regs.otg_fs_device.diepint0.reset(),
-                                1 => regs.otg_fs_device.diepint1.reset(),
-                                2 => regs.otg_fs_device.diepint2.reset(),
-                                3 => regs.otg_fs_device.diepint3.reset(),
-                                _ => unreachable!()
-                            }
+                let ep_bits = regs.otg_hs_device.otg_hs_daint.read().iepint().bits();
+
+                for i in 0..6 {
+                    if (ep_bits & (1 << i)) != 0 {
+                        match i {
+                            0 => regs.otg_hs_device.otg_hs_diepint0.modify(|_, w| w.xfrc().set_bit()),
+                            1 => regs.otg_hs_device.otg_hs_diepint1.modify(|_, w| w.xfrc().set_bit()),
+                            2 => regs.otg_hs_device.otg_hs_diepint2.modify(|_, w| w.xfrc().set_bit()),
+                            3 => regs.otg_hs_device.otg_hs_diepint3.modify(|_, w| w.xfrc().set_bit()),
+                            4 => regs.otg_hs_device.otg_hs_diepint4.modify(|_, w| w.xfrc().set_bit()),
+                            5 => regs.otg_hs_device.otg_hs_diepint5.modify(|_, w| w.xfrc().set_bit()),
+                            _ => unreachable!()
                         }
                     }
-
-                    hprintln!("transfer complete").unwrap();
-
-                    return PollResult::Data {
-                        ep_in_complete: ep_bits,
-                        ep_out: 0,
-                        ep_setup: 0,
-                    };
                 }
+
+                fiprintln!("in complete for {}", ep_bits);
+
+                fiprintln!("poll: in complete");
+                return PollResult::Data {
+                    ep_in_complete: ep_bits,
+                    ep_out: 0,
+                    ep_setup: 0,
+                };
             }
 
-            if current.usbsusp().bit_is_set() {
-                interrupts.modify(|_, w| w.usbsusp().clear_bit());
-                hprintln!("suspend received").unwrap();
-                return PollResult::Suspend;
-            }
+//            fiprintln!("none read");
 
-            if current.wkupint().bit_is_set() {
-                interrupts.modify(|_, w| w.wkupint().clear_bit());
-                hprintln!("wakeup received").unwrap();
-                return PollResult::Resume;
-            }
-
-            hprintln!("no event").unwrap();
 
             PollResult::None
         })
     }
+
 
     /// Simulates a disconnect from the USB bus, causing the host to reset and re-enumerate the
     /// device.
